@@ -40,6 +40,17 @@ WRAP_UP = {
     "role": "user",
     "content": "Time is almost up. Stop and reply with your summary.",
 }
+MAX_VERIFY_ROUNDS = 1
+MIN_VERIFY_SEC = 120  # minimum buffer above WRAP_UP_SEC to run verification
+VERIFY_PROMPT = (
+    "Before finalizing, perform a focused engineering verification pass:\n"
+    "1. Check that all required output files exist in the workspace, are"
+    " non-empty, and match the requested filenames and formats.\n"
+    "2. Run a quick python3 sanity check on numerical results, unit"
+    " conversions, and physical/code constraints from the task.\n"
+    "3. Fix any missing files, unit errors, or incomplete sections"
+    " immediately, then provide your final summary."
+)
 RESULT_CHARS = 20_000  # a longer tool result loses its middle
 # Seconds between retries once the SDK's own quick retries are exhausted.
 RETRY_WAITS = (5, 15, 30, 60, 120)
@@ -294,6 +305,7 @@ async def solve(session):
   ]
   # head: the start of an answer cut off at the output limit
   nudges, head, waits = 0, "", iter(RETRY_WAITS)
+  touched_files, verify_rounds = False, 0
   while True:
     left = session.time_left()  # None when the task has no time limit
     wrap_up = left is not None and left < WRAP_UP_SEC
@@ -339,6 +351,21 @@ async def solve(session):
     # endpoint's own fields.
     turn = message.model_dump(exclude_none=True)
     if wrap_up or not message.tool_calls:
+      if (
+          not wrap_up
+          and message.content
+          and not cut
+          and touched_files
+          and verify_rounds < MAX_VERIFY_ROUNDS
+          and (left is None or left - WRAP_UP_SEC >= MIN_VERIFY_SEC)
+      ):
+        verify_rounds += 1
+        nudges, head = 0, ""
+        turn.pop("tool_calls", None)
+        messages.append(turn)
+        messages.append({"role": "user", "content": VERIFY_PROMPT})
+        await session.log("running pre-finish engineering verification pass")
+        continue
       if wrap_up or (message.content and not cut) or nudges == MAX_NUDGES:
         return session.final_message
       nudges, head = nudges + 1, text
@@ -356,10 +383,13 @@ async def solve(session):
     nudges, head = 0, ""
     messages.append(turn)
     for call in turn["tool_calls"]:
-      await session.log(
-          f"{call['function']['name']} {call['function']['arguments'][:200]}"
-      )
-      content = await run_tool(session, call["function"])
+      fn = call["function"]
+      await session.log(f"{fn['name']} {fn['arguments'][:200]}")
+      content = await run_tool(session, fn)
+      if fn["name"] in ("write_file", "bash") and not content.startswith(
+          "error:"
+      ):
+        touched_files = True
       messages.append(
           {"role": "tool", "tool_call_id": call["id"], "content": content}
       )
